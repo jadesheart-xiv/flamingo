@@ -62,7 +62,8 @@ fn state() -> &'static Mutex<State> {
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("FLAMINGO_WC_STAT").is_some_and(|v| v == "1");
+        // The touch count (`crate::wctouch`) needs the kinds found here.
+        let on = std::env::var_os("FLAMINGO_WC_STAT").is_some_and(|v| v == "1") || crate::wctouch::on();
         if on {
             start_logging();
         }
@@ -119,10 +120,11 @@ fn kind_of(s: &State, at: u64) -> u8 {
 }
 
 /// `bytes` were written back into title memory by a copy whose first byte
-/// is `start`.
-pub(crate) fn back(start: u64, bytes: usize) {
+/// is `start`. Returns the memory's kind (0: write-combined), `u8::MAX` if
+/// not counted.
+pub(crate) fn back(start: u64, bytes: usize) -> u8 {
     if bytes == 0 || !on() {
-        return;
+        return u8::MAX;
     }
     let kind = {
         let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
@@ -134,9 +136,10 @@ pub(crate) fn back(start: u64, bytes: usize) {
                 k
             }
         }
-    } as usize;
-    BACK[kind].fetch_add(bytes as u64, Relaxed);
-    CALLS[kind].fetch_add(1, Relaxed);
+    };
+    BACK[kind as usize].fetch_add(bytes as u64, Relaxed);
+    CALLS[kind as usize].fetch_add(1, Relaxed);
+    kind
 }
 
 fn start_logging() {
@@ -168,6 +171,7 @@ fn start_logging() {
                 }
             }
             tracing::info!("{line}");
+            crate::wctouch::report();
             last.copy_from_slice(&now);
             let s = state().lock().unwrap_or_else(|e| e.into_inner());
             let mut rows: Vec<_> = s.by_protect.iter().map(|(&(p, h), &(n, b))| (b, n, p, h)).collect();

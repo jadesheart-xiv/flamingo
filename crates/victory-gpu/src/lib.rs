@@ -83,6 +83,8 @@ mod watch;
 mod texback;
 #[cfg(windows)]
 mod wcstat;
+#[cfg(windows)]
+mod wctouch;
 
 #[cfg(windows)]
 pub use host::{frame_rate, on_failure};

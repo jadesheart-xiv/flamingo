@@ -129,7 +129,7 @@ fn note_fault(from: usize, len: usize) {
 /// The handler that turns a read fault inside [`guarded`] into its return
 /// of false; put first in the line, once.
 #[cfg(target_arch = "x86_64")]
-fn install() {
+pub(crate) fn install() {
     use windows_sys::Win32::Foundation::{
         EXCEPTION_ACCESS_VIOLATION, EXCEPTION_GUARD_PAGE, EXCEPTION_IN_PAGE_ERROR,
     };
@@ -161,7 +161,7 @@ fn install() {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn install() {}
+pub(crate) fn install() {}
 
 /// Copies `len` bytes from `from` to `to` in place; false if a page of the
 /// source was not there (then some of `to` may have been written).

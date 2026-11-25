@@ -2683,7 +2683,10 @@ impl Shadow {
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         let n = self.copy_back_with_inner(address, len, found);
-        crate::wcstat::back(self.start, n);
+        if crate::wcstat::back(self.start, n) == 0 {
+            let (from, to) = self.inside(address, len);
+            crate::wctouch::arm(self.start as usize + from, self.start as usize + to);
+        }
         n
     }
 
@@ -2794,7 +2797,9 @@ impl Shadow {
     /// memory. Returns the bytes written to title memory.
     pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
         let written = self.relay_merge_inner(at, n, now, title);
-        crate::wcstat::back(self.start, written);
+        if crate::wcstat::back(self.start, written) == 0 {
+            crate::wctouch::arm(self.start as usize + at, self.start as usize + at + n);
+        }
         written
     }
 
@@ -3584,7 +3589,9 @@ impl Shadow {
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let n = self.card_merge_inner(at, gpu, title);
-        crate::wcstat::back(self.start, n);
+        if crate::wcstat::back(self.start, n) == 0 {
+            crate::wctouch::arm(self.start as usize + at, self.start as usize + at + gpu.len());
+        }
         n
     }
 
@@ -3656,7 +3663,9 @@ impl Shadow {
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
         let n = self.card_merge_relay_inner(at, gpu, fetched_after, title);
-        crate::wcstat::back(self.start, n);
+        if crate::wcstat::back(self.start, n) == 0 {
+            crate::wctouch::arm(self.start as usize + at, self.start as usize + at + gpu.len());
+        }
         n
     }
 
