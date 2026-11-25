@@ -62,8 +62,9 @@ fn state() -> &'static Mutex<State> {
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        // The touch count (`crate::wctouch`) needs the kinds found here.
-        let on = std::env::var_os("FLAMINGO_WC_STAT").is_some_and(|v| v == "1") || crate::wctouch::on();
+        // The touch count (`crate::wctouch`) and the own write-back
+        // ([`own_back`]) need the kinds found here.
+        let on = std::env::var_os("FLAMINGO_WC_STAT").is_some_and(|v| v == "1") || crate::wctouch::on() || own_back_mode() != 0;
         if on {
             start_logging();
         }
@@ -117,6 +118,57 @@ fn kind_of(s: &State, at: u64) -> u8 {
         return 3;
     }
     if info.Type == mem::MEM_PRIVATE { 5 } else { 6 }
+}
+
+/// `FLAMINGO_WC_OWN_BACK=1`: what shaders wrote into write-combined private
+/// memory goes back without counting as a title write
+/// (`Shadow::put_back_watched`, docs/wc-lazy-copyback.md phase A).
+/// `FLAMINGO_WC_OWN_BACK=alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log, for measuring it in one scene (as
+/// `VICTORY_BACK_OWN_VIEW=alt` does).
+pub(crate) fn own_back() -> bool {
+    match own_back_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+            let period = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20;
+            let on = period % 2 == 0;
+            if LAST.swap(period, Relaxed) != period {
+                tracing::info!("wc own back (FLAMINGO_WC_OWN_BACK=alt): {} from now", if on { "ON" } else { "OFF" });
+            }
+            on
+        }
+    }
+}
+
+/// 0 off, 1 on, 2 in turn.
+fn own_back_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("FLAMINGO_WC_OWN_BACK").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// Whether the copy whose first byte is `start` lies in memory the title
+/// allocated write-combined (with [`on`]; false without it).
+pub(crate) fn write_combined(start: u64) -> bool {
+    if !on() {
+        return false;
+    }
+    let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
+    let kind = match s.kinds.get(&start) {
+        Some(&k) => k,
+        None => {
+            let k = kind_of(&s, start);
+            s.kinds.insert(start, k);
+            k
+        }
+    };
+    kind == 0
 }
 
 /// `bytes` were written back into title memory by a copy whose first byte

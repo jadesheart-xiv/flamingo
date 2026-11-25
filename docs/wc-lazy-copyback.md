@@ -119,3 +119,24 @@ Same scene, same settings, three runs each, off vs on:
 
 Phase A ships alone if it pays; Phase B only behind its switch until it
 holds up in more than the opening area.
+
+## Result of phase A (built: `FLAMINGO_WC_OWN_BACK`, off by default)
+
+One run, `FLAMINGO_WC_OWN_BACK=alt` (twenty seconds on, twenty off, the
+same spot), RTX 4070, 15 steady samples each way:
+
+| | on | off |
+|---|---|---|
+| median fps | 9.6 | 9.9 |
+| upload ("copies" in preparing) per frame | 128 MB | 141 MB |
+| copy-back per frame | 32.2 ms | 26.1 ms |
+
+18 GB stored without counting as title writes, ~405,000 pages noted current
+(not taken again), 2,216 stretches left to the old way because the title
+had written there, 0 races, 0 errors. The saving was ~13 MB a frame of
+upload, less than expected (most write-combined copy-back lands in views,
+which this does not cover), and the extra kernel calls and reads per
+stretch cost ~6 ms of copy-back: no net gain. The re-upload loop on private
+memory is not what holds the frame here. Asking the bits once per range
+instead of per stretch could cut the cost; phase B, which removes the
+copy-back itself, is the larger lever.

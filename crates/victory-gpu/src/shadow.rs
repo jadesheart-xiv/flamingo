@@ -2846,13 +2846,102 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
-        if self.put_back_own(start + at, &title[..]) {
+        if self.put_back_own(start + at, &title[..]) || self.put_back_watched(start + at, &title[..]) {
             return n;
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
+    }
+
+    /// With `FLAMINGO_WC_OWN_BACK=1` (`crate::wcstat::own_back`), for a copy
+    /// of write-combined private memory: stores what a merge made of title
+    /// memory `[at, at + bytes.len())` (inside one 64 KiB page) so that our
+    /// write does not count as the title's. Today the plain copy sets the
+    /// kernel's write-watch bits, and the next refresh takes the page for a
+    /// title write and copies all 64 KiB of it in again, and up to the card,
+    /// though it holds what the GPU itself just wrote (docs/
+    /// wc-lazy-copyback.md, phase A; `put_back_own` does the same for views).
+    ///
+    /// The kernel's bits are kept for the title's own writes:
+    /// - before: the 4 KiB pages under the stretch are read, then asked
+    ///   without reset; any written since the last asking is the title's,
+    ///   not yet seen, and the stretch goes the old way;
+    /// - the stretch is written, then those pages' bits are reset;
+    /// - after: the 4 KiB pages are read again and compared with what they
+    ///   held plus our bytes. A title write that landed after the first
+    ///   read (and so may have lost its bit to the reset) shows there, and
+    ///   the page then counts as written, as before. Only a title write of
+    ///   the very bytes already there goes unseen, which changes nothing.
+    ///
+    /// The journal is told the page was written (`watch::wrote_own`), so
+    /// every other copy of it takes it again; this copy notes itself
+    /// current if it was current before, as `put_back_own` does. False with
+    /// nothing done if the switch is off, the memory is not write-combined,
+    /// is view memory, or is not write-watched (the caller writes as
+    /// before).
+    fn put_back_watched(&self, at: usize, bytes: &[u8]) -> bool {
+        /// Since the start: stretches stored this way, their bytes, pages
+        /// noted current for their copy, stretches left to the old way
+        /// because the title had written there, races caught after the
+        /// write, stretches in memory not write-watched.
+        static N: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+        if !crate::wcstat::own_back() || bytes.is_empty() || !crate::wcstat::write_combined(self.start) {
+            return false;
+        }
+        // View memory has its own way (`put_back_own`); known without
+        // asking Windows.
+        if crate::inplace::cover(at, bytes.len()) != crate::inplace::Cover::None {
+            return false;
+        }
+        let raced = match store_unwatched(at, bytes) {
+            Unwatched::NotWatched => {
+                N[5].fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            Unwatched::TitleWrote => {
+                N[3].fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            Unwatched::Stored { raced } => raced,
+        };
+        // A placed texture there changed with no descriptor written (as
+        // `crate::watch::writing` tells the texture table on the old way;
+        // there are no guards to open in private memory).
+        crate::descriptor::host::remapped(at, bytes.len());
+        let page = at / PAGE;
+        let (before, now) = crate::watch::wrote_own(page, &[]);
+        if raced {
+            // A title write landed between ours and the reset: the page
+            // counts as written for every copy, this one too.
+            N[4].fetch_add(1, Ordering::Relaxed);
+        } else {
+            let base = self.start as usize / PAGE;
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(taken) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
+                && *taken != 0
+                && *taken >= before
+            {
+                *taken = (*taken).max(now);
+                N[2].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        N[1].fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let n = N[0].fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(4096) {
+            tracing::info!(
+                "wc own back (FLAMINGO_WC_OWN_BACK=1), since the start: {n} stretches {} MB stored without counting as title writes, \
+                 {} pages noted current for the copy that wrote them; {} left to the old way (the title had written there), \
+                 {} title writes caught racing ours, {} in memory not write-watched",
+                N[1].load(Ordering::Relaxed) >> 20,
+                N[2].load(Ordering::Relaxed),
+                N[3].load(Ordering::Relaxed),
+                N[4].load(Ordering::Relaxed),
+                N[5].load(Ordering::Relaxed),
+            );
+        }
+        true
     }
 
     /// With `crate::inplace::back_own` (`VICTORY_BACK_OWN_VIEW=1`): stores
@@ -3716,7 +3805,7 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
-        if self.put_back_own(start + at, &title[..]) {
+        if self.put_back_own(start + at, &title[..]) || self.put_back_watched(start + at, &title[..]) {
             return n;
         }
         crate::watch::writing(start + at, n);
@@ -3724,6 +3813,58 @@ impl Shadow {
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
     }
+}
+
+/// What [`store_unwatched`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum Unwatched {
+    /// The memory is not write-watched: nothing done.
+    NotWatched,
+    /// A 4 KiB page under the stretch was written since the last asking
+    /// (the title's write, not yet seen): nothing done.
+    TitleWrote,
+    /// Stored, the kernel's bits reset; `raced`: the pages read back
+    /// otherwise than they held plus our bytes, so a title write landed
+    /// meanwhile and its bit may be gone.
+    Stored { raced: bool },
+}
+
+/// Writes `bytes` into write-watched title memory at `at` without leaving
+/// the kernel's write-watch bits set for our write, keeping the title's
+/// own writes seen ([`Shadow::put_back_watched`] has the rules): reads the
+/// 4 KiB pages under the stretch, asks their bits without reset, writes,
+/// resets the bits, reads again and compares.
+fn store_unwatched(at: usize, bytes: &[u8]) -> Unwatched {
+    use windows_sys::Win32::System::Memory::{GetWriteWatch, ResetWriteWatch};
+    const KERNEL_PAGE: usize = 4096;
+    let k0 = at & !(KERNEL_PAGE - 1);
+    let k1 = (at + bytes.len()).next_multiple_of(KERNEL_PAGE);
+    let pages = (k1 - k0) / KERNEL_PAGE;
+    // What the 4 KiB pages hold, read before the bits are asked: a title
+    // write before this read shows in the bits; one after it is not in
+    // `expect`, so the compare after the reset sees it.
+    let mut expect = vec![0u8; k1 - k0];
+    if !crate::host::read_into(k0 as *const u8, &mut expect) {
+        return Unwatched::NotWatched;
+    }
+    let mut found = vec![0usize; pages];
+    let (mut count, mut granularity) = (pages, 0u32);
+    // SAFETY: an out array of `count` entries; flags 0 asks without
+    // resetting.
+    let failed = unsafe { GetWriteWatch(0, k0 as *const _, k1 - k0, found.as_mut_ptr().cast(), &mut count, &mut granularity) };
+    if failed != 0 {
+        return Unwatched::NotWatched;
+    }
+    if count > 0 {
+        return Unwatched::TitleWrote;
+    }
+    expect[at - k0..at - k0 + bytes.len()].copy_from_slice(bytes);
+    crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
+    // SAFETY: the same range of write-watched title memory.
+    unsafe { ResetWriteWatch(k0 as *const _, k1 - k0) };
+    let mut now_held = vec![0u8; k1 - k0];
+    let raced = !crate::host::read_into(k0 as *const u8, &mut now_held) || now_held != expect;
+    Unwatched::Stored { raced }
 }
 
 struct Entry {
@@ -4435,4 +4576,59 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod store_unwatched_tests {
+    use super::{Unwatched, store_unwatched};
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    /// The host's write watching (not in windows-sys' memory module).
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// Pages written since the last asking, without resetting.
+    fn written(at: usize, len: usize) -> usize {
+        let mut found = vec![0usize; len / 4096];
+        let (mut count, mut granularity) = (found.len(), 0u32);
+        // SAFETY: an out array of `count` entries.
+        assert_eq!(unsafe { GetWriteWatch(0, at as *const _, len, found.as_mut_ptr().cast(), &mut count, &mut granularity) }, 0);
+        count
+    }
+
+    /// Our store leaves no write-watch bit behind; a title write not yet
+    /// asked about sends the store the old way; memory that is not
+    /// write-watched is left alone.
+    #[test]
+    fn our_write_back_does_not_count_as_a_title_write() {
+        const LEN: usize = 64 << 10;
+        // SAFETY: memory of the test's own.
+        unsafe {
+            let at = VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(at, 0);
+            // Clean: our store, then no bits, and the bytes are there. The
+            // pages are brought in first: the first touch of a page never
+            // touched, a read too, sets its bit (as title memory the
+            // copy-back writes every frame is not).
+            for page in (0..LEN).step_by(4096) {
+                std::ptr::write_volatile((at + page) as *mut u8, 0);
+            }
+            let mut found = vec![0usize; LEN / 4096];
+            let (mut count, mut granularity) = (found.len(), 0u32);
+            windows_sys::Win32::System::Memory::GetWriteWatch(1, at as *const _, LEN, found.as_mut_ptr().cast(), &mut count, &mut granularity);
+            assert_eq!(store_unwatched(at + 100, &[7u8; 300]), Unwatched::Stored { raced: false });
+            assert_eq!(written(at, LEN), 0, "our write left no bit");
+            assert_eq!(std::ptr::read_volatile((at + 250) as *const u8), 7);
+            // A title write not yet asked about: the old way, bit kept.
+            std::ptr::write_volatile((at + 4096 + 10) as *mut u8, 1);
+            assert_eq!(store_unwatched(at + 4096, &[9u8; 64]), Unwatched::TitleWrote);
+            assert_eq!(written(at, LEN), 1, "the title's bit stays");
+            VirtualFree(at as *mut _, 0, MEM_RELEASE);
+            // Not write-watched.
+            let plain = VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_eq!(store_unwatched(plain, &[1u8; 8]), Unwatched::NotWatched);
+            VirtualFree(plain as *mut _, 0, MEM_RELEASE);
+        }
+    }
 }
