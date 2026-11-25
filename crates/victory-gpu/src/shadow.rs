@@ -3582,7 +3582,11 @@ impl Shadow {
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        // Pages another copy owns (`crate::wclazy`) come from that copy's
+        // mapping: the title's are stale and guarded.
+        if !(crate::wclazy::wanted() && crate::wclazy::refresh_from_owners(self as *const Self as usize, from, to, at)) {
+            crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);

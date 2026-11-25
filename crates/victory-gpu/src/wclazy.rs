@@ -71,6 +71,12 @@ fn strikes() -> u8 {
     *N.get_or_init(|| std::env::var("FLAMINGO_WC_LAZY_STRIKES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
 }
 
+/// Since the start: per page, which of our paths fetched it, as bits: 1 the
+/// relay thread (another copy merging into the page), 2 any other thread
+/// (a refresh at submission reading it, mostly). Pages only ever fetched by
+/// refreshes could be refreshed from the owner's mapping instead.
+static PATHS: Mutex<BTreeMap<usize, u8>> = Mutex::new(BTreeMap::new());
+
 /// Counters since the last line.
 static N: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 /// Pages not owned for their strikes.
@@ -217,6 +223,74 @@ fn release(page: usize, o: &Owner) {
     RELEASED[slot].store(page, Relaxed);
 }
 
+thread_local! {
+    /// Set while [`refresh_from_owners`] holds `OWNED`'s lock: a fault on
+    /// this thread then is not one of ours (owned pages are not read from
+    /// title memory there), and the handler must not wait for the lock.
+    static IN_REFRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Pages refreshed from their owner's mapping, and their bytes, since the
+/// last line; pages fetched for a refresh because the owner does not cover
+/// the part asked for.
+static FROM_OWNER: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// For a refresh of the copy `id` (`Shadow::copy`): copies title memory
+/// `[from, to)` into `dst` (the copy's mapping at `from`), taking each page
+/// another copy owns from that copy's mapping instead of from the stale,
+/// guarded title page; a page `id` owns itself is left as the copy holds
+/// it (newer than title memory). False with nothing done if no page there
+/// is owned (the caller copies as before).
+///
+/// Overlapping copies (title buffers and the windows over them) refresh
+/// each other's GPU-owned pages at every submission, and each such read
+/// used to fetch the page back (docs/wc-lazy-copyback.md, phase B1).
+pub(crate) fn refresh_from_owners(id: usize, from: usize, to: usize, dst: *mut u8) -> bool {
+    if from >= to {
+        return false;
+    }
+    let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+    let (first, last) = (from / PAGE, (to - 1) / PAGE);
+    let pages: Vec<(usize, Owner)> = owned.range(first..=last).map(|(&p, &o)| (p, o)).collect();
+    if pages.is_empty() {
+        return false;
+    }
+    IN_REFRESH.with(|f| f.set(true));
+    let title = |a: usize, b: usize| {
+        if a < b {
+            // SAFETY: `dst` maps `[from, to)`; `[a, b)` is inside it.
+            crate::host::copy_mapped(unsafe { dst.add(a - from) }, a as *const u8, b - a, false);
+        }
+    };
+    let mut at = from;
+    for (page, o) in pages {
+        let (lo, hi) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+        title(at, lo);
+        let (clo, chi) = covered(page, &o);
+        if o.id == id {
+            // Our own page: the copy holds what title memory will get.
+        } else if clo <= lo && hi <= chi {
+            // SAFETY: the owner's mapping covers `[lo, hi)` (inside its
+            // range) and stays alive while `OWNED`'s lock is held
+            // (`shadow_gone`); `dst` maps `[from, to)`.
+            unsafe { std::ptr::copy_nonoverlapping((o.data + (lo - o.start)) as *const u8, dst.add(lo - from), hi - lo) };
+            FROM_OWNER[0].fetch_add(1, Relaxed);
+            FROM_OWNER[1].fetch_add((hi - lo) as u64, Relaxed);
+        } else {
+            // The owner covers only part of what is asked for: fetched,
+            // then read from title memory as before.
+            owned.remove(&page);
+            release(page, &o);
+            title(lo, hi);
+            FROM_OWNER[2].fetch_add(1, Relaxed);
+        }
+        at = hi;
+    }
+    title(at, to);
+    IN_REFRESH.with(|f| f.set(false));
+    true
+}
+
 /// The copy `id` goes: every page it owns is fetched first.
 pub(crate) fn shadow_gone(id: usize) {
     let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
@@ -302,6 +376,13 @@ unsafe extern "system" fn on_fault(info: *mut windows_sys::Win32::System::Diagno
         return EXCEPTION_CONTINUE_SEARCH;
     }
     let page = r.ExceptionInformation[1] / PAGE;
+    // This thread holds `OWNED`'s lock in a refresh, which reads no owned
+    // page from title memory: the fault is someone else's (an unmapped
+    // page the plain copy recovers from), and waiting for the lock here
+    // would never end.
+    if IN_REFRESH.with(|f| f.get()) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     {
         let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(o) = owned.remove(&page) {
@@ -314,6 +395,8 @@ unsafe extern "system" fn on_fault(info: *mut windows_sys::Win32::System::Diagno
                 let s = struck.entry(page).or_default();
                 *s = s.saturating_add(1);
                 drop(struck);
+                let bit = if std::thread::current().name() == Some("victory-relay") { 1 } else { 2 };
+                *PATHS.lock().unwrap_or_else(|e| e.into_inner()).entry(page).or_default() |= bit;
                 note_who(context);
             } else {
                 N[FETCH_TITLE].fetch_add(1, Relaxed);
@@ -374,6 +457,28 @@ pub(crate) fn report() {
         n[STRUCK_OUT],
         n[RETRIED],
     );
+    tracing::info!(
+        "wc lazy, refreshes of other copies, last 10 s: {} pages ({:.1} MB) taken from their owner's mapping, {} fetched (owner covers part)",
+        FROM_OWNER[0].swap(0, Relaxed),
+        FROM_OWNER[1].swap(0, Relaxed) as f64 / 1e6,
+        FROM_OWNER[2].swap(0, Relaxed)
+    );
+    {
+        let paths = PATHS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut by = [0usize; 4];
+        for &bits in paths.values() {
+            by[(bits & 3) as usize] += 1;
+        }
+        if paths.len() > 0 {
+            tracing::info!(
+                "wc lazy, pages our code fetched since the start: {} only by merges of another copy (relay thread), {} only by \
+                 refreshes and other reads, {} by both",
+                by[1],
+                by[2],
+                by[3]
+            );
+        }
+    }
     if let Some((names, places)) = WHO.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let mut names: Vec<_> = names.into_iter().collect();
         names.sort_unstable_by(|a, b| b.1.cmp(&a.1));
@@ -431,6 +536,42 @@ mod tests {
             assert_eq!(std::ptr::read_volatile((title + PAGE + 100) as *const u8), 2);
             mem::VirtualFree(title as *mut c_void, 0, mem::MEM_RELEASE);
             drop(copy);
+        }
+    }
+
+    /// Another copy's refresh of an owned page takes the owner's bytes,
+    /// with no fault and the page still owned; the parts of the range that
+    /// are not owned come from title memory.
+    #[test]
+    fn another_copy_refreshes_an_owned_page_from_its_owner() {
+        // SAFETY: memory of the test's own.
+        unsafe {
+            let title = mem::VirtualAlloc(std::ptr::null(), 2 * PAGE, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE) as usize;
+            assert_ne!(title, 0);
+            for at in (0..2 * PAGE).step_by(4096) {
+                std::ptr::write_volatile((title + at) as *mut u8, 1);
+            }
+            let mut found = vec![0usize; 2 * PAGE / 4096];
+            let (mut count, mut g) = (found.len(), 0u32);
+            windows_sys::Win32::System::Memory::GetWriteWatch(1, title as *const _, 2 * PAGE, found.as_mut_ptr().cast(), &mut count, &mut g);
+            let page = title / PAGE;
+            let owner_copy = vec![2u8; PAGE];
+            let o = Owner { id: 0xa11ce, data: owner_copy.as_ptr() as usize, start: title, len: PAGE };
+            assert!(own(page, o));
+            // Copy B covers both pages: the first from its owner, the second
+            // from title memory.
+            let mut b = vec![0u8; 2 * PAGE];
+            assert!(refresh_from_owners(0xb0b, title, title + 2 * PAGE, b.as_mut_ptr()));
+            assert_eq!(b[100], 2, "the owned page comes from the owner's copy");
+            assert_eq!(b[PAGE], 1, "the page not owned comes from title memory");
+            assert!(owned_by(page, 0xa11ce), "still owned: no fault, no fetch");
+            // The owner's own refresh leaves its bytes as they are.
+            let mut own_copy = vec![7u8; PAGE];
+            assert!(refresh_from_owners(0xa11ce, title, title + PAGE, own_copy.as_mut_ptr()));
+            assert_eq!(own_copy[100], 7);
+            shadow_gone(0xa11ce);
+            mem::VirtualFree(title as *mut c_void, 0, mem::MEM_RELEASE);
+            drop(owner_copy);
         }
     }
 }

@@ -176,3 +176,36 @@ through title memory (a refresh of a page another copy owns taking it from
 that copy's mapping, not from the title's address; merges into such a page
 going to the owner). That is a change to how copies overlap, not to the
 copy-back, and the next thing to look at before any more of phase B.
+
+## Overlapping copies (built: refresh from the owner)
+
+Per page, which of our paths fetched it (4-minute run, strikes off): 60
+pages only by refreshes of another copy, 39 by refreshes and merges, 3 only
+by merges; 102 pages (6.4 MB) in all, each fetched thousands of times.
+
+A refresh (`Shadow::copy`) of a page another copy owns now takes the bytes
+from the owner's mapping instead of the stale, guarded title page
+(`wclazy::refresh_from_owners`, under the owners' lock; a fault on that
+thread meanwhile is not ours and is passed on). Unattended `alt` run:
+
+| | on | off |
+|---|---|---|
+| median fps | 11.0 | 10.6 (ranges overlap: noise) |
+| preparing / copy-back per frame | 41.0 / 23.9 ms | 45.7 / 22.5 ms |
+
+145-226 pages per 10 s were refreshed from their owner with no fault, and
+our own code fetched no page in the handler any more. But the copy-back left
+out stayed at 0.2-1.5 MB per 10 s:
+
+- 715-1,092 refreshes per 10 s asked for parts of a page the owner does not
+  cover (a 4 MiB window over a smaller buffer) and fetched it;
+- the pages our code still fetched were now 92 only by merges of another
+  copy: two copies **both written by shaders** over the same bytes, which
+  can only meet in title memory.
+
+So on this title the overlap is not only copies reading each other but
+copies written by the GPU through two host buffers. Lazy copy-back cannot
+pay until overlapping copies are made one (a window and the buffers inside
+it sharing one host buffer, or the buffers placed inside the window's). That
+is a change to how `shadow.rs` makes copies, larger than this phase. All of
+it stays off by default.
