@@ -2134,6 +2134,9 @@ pub(crate) fn copy_on_card(list: &HostList, dst: u64, src: u64, len: u64) -> boo
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // Pages this copy owns (`crate::wclazy`) get its bytes first, while
+        // its mapping is still there.
+        crate::wclazy::shadow_gone(self as *const Self as usize);
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -2832,6 +2835,18 @@ impl Shadow {
         let last = last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
+        // A page this copy owns (`crate::wclazy`): title memory stays stale
+        // and guarded; the copy holds the page's bytes, fetched at its
+        // first touch. The snapshot moves on as a merge would move it.
+        if crate::wclazy::on() && crate::wclazy::owned_by((start + at) / crate::wclazy::PAGE, self as *const Self as usize) {
+            held.copy_from_slice(now);
+            crate::wclazy::skipped(n);
+            // Other copies of the page take it again (their read fetches
+            // it); this one stays current. A placed texture there changed.
+            self.note_current_own((start + at) / PAGE);
+            crate::descriptor::host::remapped(start + at, n);
+            return n;
+        }
         title.clear();
         title.resize(n, 0);
         // Title memory not there: looked at again when the next flight
@@ -2846,13 +2861,72 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
-        if self.put_back_own(start + at, &title[..]) || self.put_back_watched(start + at, &title[..]) {
+        if self.put_back_own(start + at, &title[..]) || self.lazy_enter(start + at, &title[..]) || self.put_back_watched(start + at, &title[..]) {
             return n;
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
+    }
+
+    /// Tells the journal that `page` (a 64 KiB page number) was written by
+    /// us, so every other copy of it takes it again, and notes this copy
+    /// current for it if it was current before. Whether it is current.
+    fn note_current_own(&self, page: usize) -> bool {
+        let (before, now) = crate::watch::wrote_own(page, &[]);
+        let base = self.start as usize / PAGE;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        match page.checked_sub(base).and_then(|i| copied.get_mut(i)) {
+            Some(taken) if *taken != 0 && *taken >= before => {
+                *taken = (*taken).max(now);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// With `FLAMINGO_WC_LAZY` (`crate::wclazy`), for a copy of
+    /// write-combined private memory in the PC's memory: stores a merged
+    /// stretch as [`Shadow::put_back_watched`] does, and if no title write
+    /// raced it and the copy is current for the page, makes the page
+    /// GPU-owned (`crate::wclazy::own` checks the whole page clean). False
+    /// with nothing done if the switch is off or the memory does not
+    /// qualify, or the title had written there (the caller writes as
+    /// before).
+    fn lazy_enter(&self, at: usize, bytes: &[u8]) -> bool {
+        if !crate::wclazy::on()
+            || bytes.is_empty()
+            || self.card.is_some()
+            || !crate::wcstat::write_combined(self.start)
+            || crate::inplace::cover(at, bytes.len()) != crate::inplace::Cover::None
+        {
+            return false;
+        }
+        let raced = match store_unwatched(at, bytes) {
+            Unwatched::NotWatched | Unwatched::TitleWrote => return false,
+            Unwatched::Stored { raced } => raced,
+        };
+        crate::descriptor::host::remapped(at, bytes.len());
+        let page = at / PAGE;
+        if raced {
+            // A title write landed meanwhile: the page counts as written
+            // for every copy, this one too; not owned.
+            crate::watch::wrote_own(page, &[]);
+            return true;
+        }
+        if self.note_current_own(page) {
+            crate::wclazy::own(
+                page,
+                crate::wclazy::Owner {
+                    id: self as *const Self as usize,
+                    data: self.data as usize,
+                    start: self.start as usize,
+                    len: self.len as usize,
+                },
+            );
+        }
+        true
     }
 
     /// With `FLAMINGO_WC_OWN_BACK=1` (`crate::wcstat::own_back`), for a copy

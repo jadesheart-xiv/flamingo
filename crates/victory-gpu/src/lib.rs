@@ -85,6 +85,8 @@ mod texback;
 mod wcstat;
 #[cfg(windows)]
 mod wctouch;
+#[cfg(windows)]
+mod wclazy;
 
 #[cfg(windows)]
 pub use host::{frame_rate, on_failure};

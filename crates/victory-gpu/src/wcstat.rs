@@ -64,7 +64,7 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| {
         // The touch count (`crate::wctouch`) and the own write-back
         // ([`own_back`]) need the kinds found here.
-        let on = std::env::var_os("FLAMINGO_WC_STAT").is_some_and(|v| v == "1") || crate::wctouch::on() || own_back_mode() != 0;
+        let on = std::env::var_os("FLAMINGO_WC_STAT").is_some_and(|v| v == "1") || crate::wctouch::on() || own_back_mode() != 0 || crate::wclazy::wanted();
         if on {
             start_logging();
         }
@@ -224,6 +224,7 @@ fn start_logging() {
             }
             tracing::info!("{line}");
             crate::wctouch::report();
+            crate::wclazy::report();
             last.copy_from_slice(&now);
             let s = state().lock().unwrap_or_else(|e| e.into_inner());
             let mut rows: Vec<_> = s.by_protect.iter().map(|(&(p, h), &(n, b))| (b, n, p, h)).collect();

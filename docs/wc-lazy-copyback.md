@@ -140,3 +140,39 @@ stretch cost ~6 ms of copy-back: no net gain. The re-upload loop on private
 memory is not what holds the frame here. Asking the bits once per range
 instead of per stretch could cut the cost; phase B, which removes the
 copy-back itself, is the larger lever.
+
+## Result of phase B, first step (built: `FLAMINGO_WC_LAZY`, off by default)
+
+Built for private memory, copies in the PC's memory, the relay's merges
+(`crates/victory-gpu/src/wclazy.rs`). Unattended runs with scripted keys,
+RTX 4070, the character standing in the first area, `alt` twenty seconds
+on and off:
+
+| run | median fps on | median fps off | MB not written to title memory |
+|---|---|---|---|
+| B1 as designed | 10.4 | 11.4 | 2-7 MB/s of ~400 |
+| B1 + strikes (a page our code fetched twice is not owned again) | 11.3 | 11.3 | 0 |
+
+No errors, no device loss in any run. The mechanism works (pages owned,
+fetched at their first touch, given back to their copy's bytes), but in
+gameplay ~90% of the pages owned were fetched straight back **by our own
+code**. The call chains, unwound from the faults and looked up in the PDB:
+
+- `relay_land → Shadow::relay_merge → read_into` (~45%): another copy
+  merging into a page a different copy owns;
+- `Host::submit → Shadow::update → update_free → copy → copy_mapped`
+  (~50%): another copy's refresh re-reading the page (the journal tells
+  every other copy the page changed, as it must);
+- `stale_under_flights → merge_under_writes` (a few %).
+
+So the write-combined memory is covered by more than one host copy (title
+buffers and the 4 MiB windows over the same bytes), and the others read
+title memory every frame. With strikes, ~10,000 page owns per 10 s are
+refused: nearly every page is such a page. Skipping copy-back cannot pay
+while the other copies take their bytes from title memory.
+
+What would: copies of the same memory synced with each other instead of
+through title memory (a refresh of a page another copy owns taking it from
+that copy's mapping, not from the title's address; merges into such a page
+going to the owner). That is a change to how copies overlap, not to the
+copy-back, and the next thing to look at before any more of phase B.
