@@ -95,6 +95,9 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    // What the title asked for, before the console bits are masked off
+    // (`victory_gpu::title_memory_attributes`, `FLAMINGO_WC_STAT`).
+    let title_protect = protect;
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -170,6 +173,11 @@ pub extern "system" fn XMemVirtualAlloc(
     // (it looks again only now and then otherwise).
     if !at.is_null() && kind & MEM_COMMIT != 0 {
         victory_gpu::title_memory_committed(at as usize, size);
+    }
+    // A commit inside an earlier reservation keeps the reservation's
+    // attributes unless it states its own.
+    if !at.is_null() && (base.is_null() || title_protect != 0) {
+        victory_gpu::title_memory_attributes(at as usize, size, title_protect, flags, false);
     }
     at
 }
@@ -314,6 +322,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         user.sub(HEADER)
             .cast::<[usize; 2]>()
             .write([layout.size(), layout.align()]);
+        victory_gpu::title_memory_attributes(user as usize, size, 0, attributes, true);
         user.cast()
     }
 }

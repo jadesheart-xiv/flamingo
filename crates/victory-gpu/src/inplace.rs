@@ -1066,16 +1066,52 @@ unsafe fn cost(p: &mut Probe, rig: &mut Rig, memory: &dyn Fn() -> Option<[u64; 4
 
 /// Counts and bytes by kind, in the order of [`KINDS`].
 #[derive(Default, Clone, Copy)]
-struct Tally([(u64, u64); 6]);
+struct Tally([(u64, u64); 8]);
 
-const KINDS: [&str; 6] = [
+const KINDS: [&str; 8] = [
     "private, committed whole (a part can be opened)",
     "view memory, one run of a section (one placed buffer)",
     "view memory, scattered pages",
     "view memory with unmapped pages",
-    "private but not committed whole, or guarded",
+    "private, committed whole, some pages read-only (write guards)",
+    "private, some pages not committed",
+    "private, more than one allocation",
     "other",
 ];
+
+/// For private memory that is not one read-write region: walks the
+/// regions of `[at, end)` and says what stands in the way of opening it
+/// as one part ([`KINDS`] 0, 4, 5, 6 or 7). Read-only pages are mostly
+/// the write watch's guards (`watch::protect`), which a part opened in
+/// place would not need; uncommitted pages or a second allocation cannot
+/// be opened as one part at all.
+fn private_walk(at: usize, end: usize) -> usize {
+    let mut p = at;
+    let mut allocation = None;
+    let mut read_only = false;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { mem::VirtualQuery(p as *const c_void, &mut info, size_of_val(&info)) };
+        if n == 0 || info.Type != mem::MEM_PRIVATE {
+            return 7;
+        }
+        if info.State != mem::MEM_COMMIT {
+            return 5;
+        }
+        if *allocation.get_or_insert(info.AllocationBase as usize) != info.AllocationBase as usize {
+            return 6;
+        }
+        match info.Protect {
+            mem::PAGE_READWRITE => {}
+            mem::PAGE_READONLY => read_only = true,
+            _ => return 7,
+        }
+        p = (info.BaseAddress as usize).saturating_add(info.RegionSize.max(1));
+    }
+    if read_only { 4 } else { 0 }
+}
 
 fn kind_of(at: usize, len: usize, known: &mut Vec<(usize, usize)>) -> usize {
     match cover(at, len) {
@@ -1093,17 +1129,19 @@ fn kind_of(at: usize, len: usize, known: &mut Vec<(usize, usize)>) -> usize {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
     if n == 0 {
-        return 5;
+        return 7;
     }
     let reach = (info.BaseAddress as usize).saturating_add(info.RegionSize);
     if info.Type == mem::MEM_PRIVATE && info.State == mem::MEM_COMMIT && info.Protect == mem::PAGE_READWRITE {
         known.push((info.BaseAddress as usize, reach));
-        return if reach >= end { 0 } else { 4 };
+        if reach >= end {
+            return 0;
+        }
     }
     match info.Type {
-        mem::MEM_PRIVATE => 4,
+        mem::MEM_PRIVATE => private_walk(at, end),
         mem::MEM_MAPPED => 3,
-        _ => 5,
+        _ => 7,
     }
 }
 
@@ -1418,6 +1456,27 @@ mod tests {
             assert!(text.contains("census,   view memory, scattered pages: 1 of"), "{text}");
             assert!(text.contains("census,   view memory, one run of a section (one placed buffer): 1 of"), "{text}");
             views_gone(view as usize, 3 * K64);
+            mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// Private memory that is not one read-write region is told apart by
+    /// what stands in the way: read-only pages, uncommitted pages, or a
+    /// second allocation.
+    #[test]
+    fn census_splits_private_memory_by_what_is_in_the_way() {
+        // SAFETY: allocations of the test's own.
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 8 * K64, mem::MEM_RESERVE, mem::PAGE_NOACCESS) as usize;
+            assert!(!mem::VirtualAlloc(base as *const c_void, 4 * K64, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+            let mut old = 0;
+            assert_ne!(mem::VirtualProtect((base + K64) as *const c_void, K64, mem::PAGE_READONLY, &mut old), 0);
+            let a = base as u64;
+            let k = K64 as u64;
+            let text = census_of(&[(a, 4 * k, false), (a + 2 * k, 4 * k, false), (a + 2 * k, 2 * k, false)]).join("\n");
+            assert!(text.contains("census,   private, committed whole, some pages read-only (write guards): 1 of"), "{text}");
+            assert!(text.contains("census,   private, some pages not committed: 1 of"), "{text}");
+            assert!(text.contains("census,   private, committed whole (a part can be opened): 1 of"), "{text}");
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }

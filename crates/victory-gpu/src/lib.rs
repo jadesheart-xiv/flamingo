@@ -81,9 +81,13 @@ mod texture;
 mod watch;
 #[cfg(windows)]
 mod texback;
+#[cfg(windows)]
+mod wcstat;
 
 #[cfg(windows)]
 pub use host::{frame_rate, on_failure};
+#[cfg(windows)]
+pub use wcstat::title_memory_attributes;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
